@@ -1,0 +1,51 @@
+/* One stylesheet for every page. Kept small and plain on purpose: the same
+   markup has to stay readable in a text browser in the recovery system, so
+   nothing here may be load-bearing -- it decorates, it does not lay out
+   meaning. */
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 "Segoe UI", system-ui, sans-serif;
+       color: #22282e; background: #f4f5f7; display: flex; min-height: 100vh; }
+nav { width: 210px; flex: 0 0 210px; background: #232c35; color: #fff; padding: 22px 0; }
+nav h1 { font-size: 16px; margin: 0 20px 2px; }
+nav p { margin: 0 20px 22px; color: #8b949e; font-size: 12px; }
+nav ul { list-style: none; margin: 0; padding: 0; }
+nav a { display: block; padding: 11px 20px; color: #d7dde3; text-decoration: none; }
+nav a:hover { background: #2c3742; }
+nav a.on { background: #37444f; color: #fff; box-shadow: inset 3px 0 0 #3f8f5b; }
+main { flex: 1; padding: 22px 26px 40px; min-width: 0; }
+h2 { margin: 0 0 2px; font-size: 20px; }
+.sub { color: #6b747d; margin: 0 0 20px; }
+.card { background: #fff; border: 1px solid #e0dedc; border-radius: 4px;
+        padding: 18px 20px; margin-bottom: 18px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #edeceb; }
+th { color: #6b747d; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.part td:first-child { padding-left: 34px; color: #6b747d; }
+label { display: block; margin-bottom: 4px; color: #47505a; }
+input[type=text], select { width: 100%; max-width: 520px; padding: 6px 8px;
+        border: 1px solid #c9cdd1; border-radius: 3px; font: inherit; }
+.row { margin-bottom: 13px; }
+.hint { color: #6b747d; font-size: 12px; margin-top: 3px; }
+button, .btn { font: inherit; padding: 7px 16px; border-radius: 3px; cursor: pointer;
+        border: 1px solid #c9cdd1; background: #fff; color: #22282e; text-decoration: none;
+        display: inline-block; }
+button.primary { background: #3f8f5b; border-color: #35784d; color: #fff; }
+button.danger { background: #b23a3a; border-color: #98302f; color: #fff; }
+.pct { font-size: 34px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.eta { color: #6b747d; margin-left: 12px; }
+.bar { height: 26px; background: #e6e8ea; border-radius: 3px; overflow: hidden; margin: 10px 0; }
+.bar > i { display: block; height: 100%; background: #3f8f5b; width: 0; }
+.zahlen { color: #47505a; font-variant-numeric: tabular-nums; }
+pre.log { background: #fbfbfc; border: 1px solid #e0dedc; border-radius: 3px;
+        padding: 10px 12px; max-height: 340px; overflow: auto; font-size: 12px;
+        font-family: Consolas, "DejaVu Sans Mono", monospace; white-space: pre; margin: 0; }
+.warn { background: #fdeaea; border: 1px solid #f0c2c2; color: #8f2727;
+        padding: 14px 18px; border-radius: 4px; margin-bottom: 18px; }
+.warn b { display: block; font-size: 15px; margin-bottom: 4px; }
+.ok { color: #35784d; } .bad { color: #b23a3a; } .muted { color: #6b747d; }
+ul.srcs { list-style: none; padding: 0; margin: 0; }
+ul.srcs li { padding: 5px 0; border-bottom: 1px solid #edeceb; }
+ul.srcs label { display: flex; gap: 9px; align-items: baseline; margin: 0; color: #22282e; }
+.flash { background: #eef6f0; border: 1px solid #cfe3d6; padding: 9px 14px;
+        border-radius: 3px; margin-bottom: 16px; }

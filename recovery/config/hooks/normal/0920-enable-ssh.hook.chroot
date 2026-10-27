@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+systemctl enable ssh 2>/dev/null || update-rc.d ssh enable 2>/dev/null || true
+# Holt die Schluesselliste beim Start vom Bootserver, damit sie sich
+# tauschen laesst, ohne das Abbild neu zu bauen.
+systemctl enable borg-authorized-keys.service 2>/dev/null || true
+# allow root login by key in the live environment (recovery is root-only, ephemeral)
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config || true

@@ -1,0 +1,11 @@
+#!/bin/sh
+# What xinit starts on the X server of the recovery system: a window manager
+# that shows exactly one window at a time, and the interface in it.
+#
+# matchbox rather than a desktop: the recovery system has one window, and
+# dialogs ("Really overwrite?") should appear on top of it rather than
+# somewhere. Title bars come from the interface itself (FlatLaf), so matchbox
+# runs without its own. It costs 300 kB.
+xset s off -dpms 2>/dev/null || true
+matchbox-window-manager -use_titlebar no -use_cursor yes &
+exec /usr/local/bin/borgi gui --fullscreen

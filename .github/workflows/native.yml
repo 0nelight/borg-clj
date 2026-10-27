@@ -1,0 +1,138 @@
+name: native
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: borgi-linux-x86_64
+            out: borgi
+          - os: windows-latest
+            artifact: borgi-windows-x86_64.exe
+            out: borgi.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '25'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          native-image-job-reports: 'true'
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with:
+          cli: latest
+      - name: compile
+        run: |
+          clojure -M -e "(binding [*compile-path* \"classes\"] (compile 'borgclj.main))"
+        shell: bash
+      - name: native-image
+        run: |
+          mkdir -p classes
+          CP="classes:$(clojure -Spath)"
+          if [ "${{ runner.os }}" = "Windows" ]; then CP="classes;$(clojure -Spath)"; fi
+          native-image -cp "$CP" -o "${{ matrix.out }}" --no-fallback \
+            --enable-native-access=ALL-UNNAMED \
+            --features=clj_easy.graal_build_time.InitClojureClasses \
+            --initialize-at-build-time=borgclj \
+            -march=compatibility -H:+UnlockExperimentalVMOptions \
+            -H:IncludeResources='.*\.(properties|so|dll|dylib)$' \
+            -H:IncludeResources='app\.(css|js)$' \
+            -H:IncludeLocales=de,en \
+            -H:ConfigurationFileDirectories=graal borgclj.main
+        shell: bash
+      - name: smoke
+        run: |
+          ./${{ matrix.out }} platform
+          if [ "${{ runner.os }}" = "Windows" ]; then ./${{ matrix.out }} disks; fi
+          # a build that dropped the HTTP server or the embedded stylesheet
+          # would still pass every other check, so it is tried here
+          ./${{ matrix.out }} ui --no-browser --port 8799 --url-file url.txt &
+          for _ in $(seq 1 50); do [ -s url.txt ] && break; sleep 0.2; done
+          URL=$(cat url.txt)
+          curl -sf "$URL" -o /dev/null
+          curl -sf "http://127.0.0.1:8799/app.css?t=${URL##*t=}" | grep -q '\.bar'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8799/app.css)" = 403
+          kill %1
+        shell: bash
+      # "borgi gui" loads AWT from shared libraries native-image puts beside the
+      # binary; they travel with it. On Windows AWT also wants the JDK's font
+      # configuration in lib/ next to borgi.exe (java.home/lib).
+      - name: gui files
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            mkdir -p lib
+            cp "$JAVA_HOME/lib/fontconfig.bfc" lib/ || echo "no fontconfig.bfc in $JAVA_HOME/lib"
+          fi
+          ls -l
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.out }}
+            *.so
+            *.dll
+            lib/
+
+  # NSIS laeuft unter Linux und erzeugt trotzdem eine Windows-Datei -- der
+  # Installer braucht also keinen Windows-Laeufer, nur das dort gebaute Binary.
+  installer:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: borgi-windows-x86_64.exe
+          path: nutzlast
+      - name: nsis
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nsis
+      - name: bauen
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          case "$VERSION" in refs/*|"") VERSION=0.0.0-dev;; esac
+          test -f nutzlast/borgi.exe
+          VERSION="$VERSION" installer/build.sh nutzlast
+          mv installer/borg-imager-setup-*.exe .
+          ls -l borg-imager-setup-*.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: borg-imager-setup
+          path: borg-imager-setup-*.exe
+
+  release:
+    needs: [build, installer]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: eingang }
+      # Jedes Artefakt kommt als eigenes Verzeichnis an; die Datei darin heisst
+      # ueberall gleich. Erst der Verzeichnisname macht sie unterscheidbar.
+      - name: Dateien benennen
+        run: |
+          mkdir -p dateien
+          cp eingang/borgi-linux-x86_64/borgi          dateien/borgi-linux-x86_64
+          cp eingang/borgi-windows-x86_64.exe/borgi.exe dateien/borgi-windows-x86_64.exe
+          cp eingang/borg-imager-setup/borg-imager-setup-*.exe dateien/
+          cd dateien && sha256sum * > SHA256SUMS && ls -l
+      - name: veroeffentlichen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "borg-imager ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dateien/*

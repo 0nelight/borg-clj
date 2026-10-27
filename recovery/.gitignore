@@ -1,0 +1,29 @@
+/chroot/
+/cache/
+/binary/
+/.build/
+/out/
+/config/binary
+/config/bootstrap
+/config/chroot
+/config/common
+/config/source
+/config/includes.binary/
+/config/includes.chroot/usr/local/bin/borgi
+/config/includes.chroot/usr/local/lib/borgi/
+/config/includes.chroot/usr/local/bin/borg
+*.iso
+*.files
+*.buildlog
+chroot.packages.*
+/.lock
+/chroot.*
+/binary.*
+/live-image-*
+/*.contents
+/*.packages
+
+# lb config verlinkt die mitgelieferten live-build-Hooks hier herein. Sie
+# gehoeren dem Bauwirt, nicht dem Projekt -- eigene Hooks tragen 09xx.
+/config/hooks/normal/*
+!/config/hooks/normal/09*

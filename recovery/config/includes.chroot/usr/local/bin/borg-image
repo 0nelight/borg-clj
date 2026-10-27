@@ -1,0 +1,80 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+borg-image --repo LOCATION --source DEVICE [options]
+
+Images a disk or a partition into a borg repository, from the recovery system
+itself. The counterpart to borg-restore-disk: that one writes a machine back,
+this one takes it in the first place -- for a machine that cannot run the
+Windows imager, or one that is already too broken to boot.
+
+  --repo LOCATION   ssh://user@host/srv/repo, or a local path
+  --source DEVICE   /dev/sda, /dev/nvme0n1, /dev/sda2 -- disk or partition
+  --archive NAME    archive name (default: <modell>-<seriennummer>-<datum>)
+  --block SIZE      chunk size, default 4M
+  --compression S   none, lz4, zstd or zstd,LEVEL -- default zstd,3
+  --init            create the repository if it is not there yet
+  --dry-run         open the source, print what would be read, write nothing
+
+What gets read: only the clusters or blocks in use, on NTFS and ext2/3/4. On
+NTFS the page file, hibernation file and shadow copies are left out. A whole
+disk (/dev/sda) carries no filesystem of its own and is read completely --
+image the partitions one by one instead.
+USAGE
+}
+
+REPO= SOURCE= ARCHIVE= BLOCK= COMPRESSION= INIT=0 DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO=$2; shift 2;;
+    --source) SOURCE=$2; shift 2;;
+    --archive) ARCHIVE=$2; shift 2;;
+    --block) BLOCK=$2; shift 2;;
+    --compression) COMPRESSION=$2; shift 2;;
+    --init) INIT=1; shift;;
+    --dry-run) DRY=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+[ -n "$REPO" ] && [ -n "$SOURCE" ] || { usage >&2; exit 2; }
+[ -b "$SOURCE" ] || { echo "$SOURCE is not a block device" >&2; exit 1; }
+
+BORG=${BORG:-borgi}
+eval "BORG_EXTRA=(${BORGCLJ_BORG_ARGS:-})"
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+
+if [ -z "$ARCHIVE" ]; then
+  # Der Hostname taugt hier nicht: im Rettungssystem heisst jede Maschine
+  # "rettung".
+  model=$(cat /sys/class/dmi/id/product_name 2>/dev/null | tr -cd 'A-Za-z0-9-' | cut -c1-24)
+  serial=$(cat /sys/class/dmi/id/product_serial 2>/dev/null | tr -cd 'A-Za-z0-9-' | cut -c1-16)
+  ARCHIVE="${model:-maschine}${serial:+-$serial}-$(date +%F)"
+fi
+
+echo "source   $SOURCE  $(human "$(blockdev --getsize64 "$SOURCE")")  $(lsblk -dno MODEL "$SOURCE" 2>/dev/null || true)"
+echo "fstype   $(lsblk -dno FSTYPE "$SOURCE" 2>/dev/null || echo '-')"
+echo "archive  $ARCHIVE"
+echo "repo     $REPO"
+echo
+
+args=(image "$REPO::$ARCHIVE" "file:$SOURCE")
+[ -n "$BLOCK" ] && args+=(--block "$BLOCK")
+[ -n "$COMPRESSION" ] && args+=(--compression "$COMPRESSION")
+[ "$INIT" = 1 ] && args+=(--init)
+[ "$DRY" = 1 ] && args+=(--dry-run)
+
+# --status und --stop auch hier: ein Lauf ueber SSH darf die Verbindung
+# ueberleben, und abbrechen muss man ihn koennen, ohne ihn zu erschlagen.
+if [ "$DRY" = 0 ]; then
+  mkdir -p /run/borg-recover
+  args+=(--status /run/borg-recover/image-status.edn --stop /run/borg-recover/image-stop)
+  rm -f /run/borg-recover/image-stop
+  echo "Fortschritt:  cat /run/borg-recover/image-status.edn"
+  echo "Abbruch:      touch /run/borg-recover/image-stop"
+  echo
+fi
+
+exec "$BORG" "${args[@]}" "${BORG_EXTRA[@]}"

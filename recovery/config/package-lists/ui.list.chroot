@@ -1,0 +1,16 @@
+# Extra packages for the interface in the recovery system: "borgi gui" is a
+# Swing window, the same as on Windows. It needs an X server, a small window
+# manager and the libraries AWT is built against -- about 40 MB together
+# instead of 300 to 2000 MB for a browser.
+xserver-xorg-core
+xserver-xorg-input-libinput
+xinit
+x11-xserver-utils
+matchbox-window-manager
+fonts-dejavu-core
+fontconfig
+libfreetype6
+libxext6
+libxi6
+libxrender1
+libxtst6

@@ -1,0 +1,98 @@
+name: recovery-iso
+
+# Debian veroeffentlicht etwa alle zwei Monate eine Punktversion. Der Lauf
+# schaut woechentlich nach und baut nur, wenn es zu dieser Version noch kein
+# Abbild gibt -- ein Leerlauf kostet ein paar Sekunden.
+on:
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'auch bauen, wenn es die Version schon gibt'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: welche Debian-Version steht bereit
+        id: debian
+        run: |
+          VER=$(curl -sS --fail --max-time 30 \
+                https://deb.debian.org/debian/dists/trixie/Release \
+                | awk '/^Version:/ {print $2; exit}')
+          [ -n "$VER" ] || { echo "keine Version im Release-File" >&2; exit 1; }
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "tag=recovery-$VER" >> "$GITHUB_OUTPUT"
+          echo "Debian $VER"
+
+      - name: gibt es das Abbild schon
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          elif gh release view "${{ steps.debian.outputs.tag }}" >/dev/null 2>&1; then
+            echo "build=no" >> "$GITHUB_OUTPUT"
+            echo "${{ steps.debian.outputs.tag }} existiert bereits -- nichts zu tun"
+          else
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Der live-build-chroot belegt mehrere Gigabyte; der Runner bringt ab
+      # Werk Werkzeugketten mit, die hier niemand braucht.
+      - name: Platz schaffen
+        if: steps.check.outputs.build == 'yes'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - uses: graalvm/setup-graalvm@v1
+        if: steps.check.outputs.build == 'yes'
+        with:
+          java-version: '25'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: DeLaGuardo/setup-clojure@13.0
+        if: steps.check.outputs.build == 'yes'
+        with:
+          cli: latest
+
+      - name: borgi bauen
+        if: steps.check.outputs.build == 'yes'
+        run: bin/build-native.sh borgi
+
+      - name: live-build einrichten
+        if: steps.check.outputs.build == 'yes'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            live-build debootstrap xorriso
+
+      - name: Abbild bauen
+        if: steps.check.outputs.build == 'yes'
+        run: sudo recovery/build.sh --borgi ./borgi
+
+      - name: veroeffentlichen
+        if: steps.check.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISO=$(ls recovery/out/*.iso | head -1)
+          ls -lh "$ISO"
+          sha256sum "$ISO" > "$ISO.sha256"
+          gh release create "${{ steps.debian.outputs.tag }}" \
+            --title "Rettungsabbild -- Debian ${{ steps.debian.outputs.version }}" \
+            --notes "Gebaut aus ${{ github.sha }} auf Debian ${{ steps.debian.outputs.version }}.
+
+          Mit Rufus, balenaEtcher oder \`dd\` auf einen USB-Stick schreiben.
+          Kein SSH-Zugang: das Abbild wird ohne hinterlegten Schluessel gebaut." \
+            "$ISO" "$ISO.sha256"

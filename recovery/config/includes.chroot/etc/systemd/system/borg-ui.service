@@ -1,0 +1,26 @@
+[Unit]
+Description=borg-imager interface on tty1
+After=systemd-user-sessions.service
+Conflicts=getty@tty1.service
+
+[Service]
+# An X server on tty1 with matchbox and "borgi gui --fullscreen" in it, see
+# borgi-gui-session. No browser and no HTTP: the same window as on Windows.
+# If someone closes the window, X ends -- hence Restart, or tty1 would stay
+# black.
+Type=idle
+ExecStart=/usr/bin/xinit /usr/local/bin/borgi-gui-session -- :0 vt1 -keeptty -nolisten tcp
+StandardInput=tty
+# journal+console: "borgi gui: window open" should reach the serial console as
+# well -- that is how recovery/test/netboot-test.sh tells that the interface is
+# really there, not just its service started.
+StandardOutput=journal+console
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

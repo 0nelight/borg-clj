@@ -1,0 +1,26 @@
+[Unit]
+Description=borg-imager Rettungsmenue auf tty2
+After=systemd-user-sessions.service
+Conflicts=getty@tty2.service
+
+[Service]
+Type=idle
+Environment=TERM=linux
+ExecStart=/usr/local/bin/borg-recover
+StandardInput=tty
+StandardOutput=tty
+# StandardError MUSS der Bildschirm sein, nicht das Journal. whiptail zeichnet
+# seine Oberflaeche auf stdout und gibt die Auswahl auf stderr zurueck; das
+# Skript dreht das mit dem ueblichen "3>&1 1>&2 2>&3" innerhalb von $(...) um.
+# Damit wird fd 1 zur stderr der Unit. Stand die auf "journal", landete das
+# ganze Menue im Journal, der Bildschirm blieb bei der letzten Boot-Meldung
+# stehen, und weil getty auf diesem tty maskiert ist, kam auch sonst nichts.
+StandardError=tty
+TTYPath=/dev/tty2
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

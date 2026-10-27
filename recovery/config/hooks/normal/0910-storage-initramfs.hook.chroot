@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+echo 'MODULES=most' > /etc/initramfs-tools/conf.d/storage-modules
+
+cat >> /etc/initramfs-tools/modules <<'MODS'
+vmd
+nvme
+nvme_core
+ahci
+ata_piix
+sd_mod
+sr_mod
+usb_storage
+uas
+megaraid_sas
+mpt3sas
+smartpqi
+hpsa
+aacraid
+mptspi
+3w-9xxx
+dm_mod
+dm_raid
+md_mod
+raid0
+raid1
+raid456
+MODS
+
+update-initramfs -u -k all

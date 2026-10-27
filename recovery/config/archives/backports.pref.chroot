@@ -1,0 +1,11 @@
+Package: linux-image-amd64 linux-image-*-amd64 linux-headers-* linux-kbuild-*
+Pin: release n=trixie-backports
+Pin-Priority: 600
+
+Package: firmware-* intel-microcode amd64-microcode
+Pin: release n=trixie-backports
+Pin-Priority: 600
+
+Package: *
+Pin: release n=trixie-backports
+Pin-Priority: 100

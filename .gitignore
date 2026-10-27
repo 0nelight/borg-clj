@@ -1,0 +1,21 @@
+/classes/
+# Die GraalVM-Installation, die bin/build-native.sh benutzt. Rund 1 GB --
+# gehoert nicht in die Versionsgeschichte.
+/graalvm/
+/target/
+/borgi
+# native-image legt fuer "borgi gui" die AWT-Bibliotheken neben das Binary
+/lib*.so
+/*.dll
+/borg
+/borg-small
+*.build_artifacts.txt
+.cpcache/
+installer/*.exe
+/borg-test
+/borg-radar
+.clj-kondo/.cache/
+.lsp/.cache/
+
+# Der Bau legt den Schluessel hier ab -- er gehoert nicht ins Repository.
+/recovery/config/includes.chroot/root/.ssh/authorized_keys

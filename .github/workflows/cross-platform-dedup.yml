@@ -1,0 +1,158 @@
+name: cross-platform-dedup
+
+# Sichert borg-imager dieselbe Platte einmal unter Windows und einmal aus dem
+# Rettungssystem, muessen beide Laeufe dieselben Chunk-Grenzen erzeugen --
+# sonst dedupliziert nichts gegeneinander und jede Sicherung faengt von vorn an.
+#
+# Das Risiko liegt in zwei unabhaengigen MFT-Lesern: src/borgclj/win/mft.clj
+# geht ueber Windows-Aufrufe, src/borgclj/ntfs.clj liest die Strukturen selbst.
+# Sind die sich uneinig, weichen die Schnitte voneinander ab.
+#
+# Was dieser Lauf zeigt: beide Plattformen planen dieselbe Datentraegerdatei
+# identisch -- gleiche belegte Bytes, gleiche Blockzahl, gleiche Schnittzahl,
+# gleiche MFT-Dateizahl. Was er NICHT zeigt: Gleichheit der Chunk-Kennungen.
+# Dafuer muesste Windows in ein Repository schreiben, und das verlangt einen
+# borg-serve-Prozess, den es fuer Windows nicht gibt.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-plan:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '25' }
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with: { cli: latest }
+
+      # Hyper-V-Cmdlets gibt es auf den Laeufern nicht; diskpart schon, und es
+      # bringt den VHD-Treiber selbst mit. "fixed" ist roh plus 512-Byte-Fuss,
+      # damit Linux die Datei spaeter unveraendert per losetup lesen kann.
+      - name: NTFS-Datentraeger anlegen
+        shell: cmd
+        run: |
+          (
+            echo create vdisk file=%CD%\pruef.vhd maximum=256 type=fixed
+            echo select vdisk file=%CD%\pruef.vhd
+            echo attach vdisk
+            echo create partition primary
+            echo format fs=ntfs quick label=PRUEFUNG
+            echo assign letter=T
+          ) > mkvhd.txt
+          diskpart /s mkvhd.txt
+
+      - name: Inhalt schreiben
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path T:\unter | Out-Null
+          # Fester Inhalt: der Datentraeger wird als Artefakt weitergereicht,
+          # verglichen wird spaeter ohnehin ueber SHA256.
+          $b = [byte[]]::new(3MB); (New-Object Random 42).NextBytes($b)
+          [IO.File]::WriteAllBytes('T:\zufall.bin', $b)
+          'hallo aus NTFS' | Out-File -Encoding ascii T:\hallo.txt
+          [IO.File]::WriteAllBytes('T:\unter\nullen.bin', [byte[]]::new(1MB))
+          Get-ChildItem -Recurse T:\ | Select-Object FullName,Length
+
+      - name: planen
+        shell: pwsh
+        run: |
+          clojure -J--enable-native-access=ALL-UNNAMED -M -m borgclj.main `
+            image --dry-run --snapshot none C:\keinrepo::t1 T: 2>&1 |
+            Tee-Object -FilePath windows-plan.txt
+        continue-on-error: false
+
+      - name: abhaengen und Pruefsumme
+        shell: pwsh
+        run: |
+          @"
+          select vdisk file=$PWD\pruef.vhd
+          detach vdisk
+          "@ | Out-File -Encoding ascii detach.txt
+          diskpart /s detach.txt
+          (Get-FileHash pruef.vhd -Algorithm SHA256).Hash.ToLower() +
+            "  pruef.vhd" | Out-File -Encoding ascii pruef.vhd.sha256
+          Get-Content pruef.vhd.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pruefdatentraeger
+          path: |
+            pruef.vhd
+            pruef.vhd.sha256
+            windows-plan.txt
+
+  linux-plan:
+    needs: windows-plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: pruefdatentraeger }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '25' }
+      - uses: DeLaGuardo/setup-clojure@13.0
+        with: { cli: latest }
+
+      - name: derselbe Datentraeger?
+        run: |
+          sha256sum -c pruef.vhd.sha256
+          echo "Bytes identisch -- der Vergleich betrachtet dieselben Daten."
+
+      - name: Partition bereitstellen
+        id: loop
+        run: |
+          DEV=$(sudo losetup -P -f --show pruef.vhd)
+          echo "dev=$DEV" >> "$GITHUB_OUTPUT"
+          lsblk -o NAME,SIZE,FSTYPE "$DEV"
+          test -b "${DEV}p1" || { echo "keine Partition gefunden" >&2; exit 1; }
+          # Lesbar machen statt die JVM zu erhoehen: unter sudo fehlen ihr
+          # JAVA_HOME und der Abhaengigkeits-Cache.
+          sudo chmod a+r "${DEV}p1"
+
+      - name: planen
+        run: |
+          clojure -J--enable-native-access=ALL-UNNAMED \
+            -M -m borgclj.main \
+            image --dry-run /keinrepo::t1 "file:${{ steps.loop.outputs.dev }}p1" \
+            2>&1 | tee linux-plan.txt
+
+      # Die erste Zeile nennt die Quelle (T: gegen loop0p1) und muss abweichen.
+      # "free clusters" liefert nur der Windows-Pfad.
+      - name: Plaene vergleichen
+        run: |
+          norm() {
+            grep -E '^  (length|allocated|chunking|blocks|cuts|mft files|mft runs|cluster size|clusters|bitmap driven|ntfs|sector size) ' "$1" \
+              | sed 's/[[:space:]]\+/ /g' | sort
+          }
+          norm windows-plan.txt > w.txt
+          norm linux-plan.txt   > l.txt
+          echo "--- Windows ---"; cat w.txt
+          echo "--- Linux   ---"; cat l.txt
+          if diff -u w.txt l.txt; then
+            echo
+            echo "UEBEREINSTIMMUNG: beide Plattformen planen dieselben Grenzen."
+          else
+            echo
+            echo "ABWEICHUNG: die MFT-Leser sind sich uneinig -- Sicherungen von" >&2
+            echo "Windows und aus dem Rettungssystem deduplizieren nicht." >&2
+            exit 1
+          fi
+
+      - name: Raster ist deterministisch
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq borgbackup
+          D=$(mktemp -d)
+          run() { clojure -J--enable-native-access=ALL-UNNAMED \
+                    -M -m borgclj.main image "$@" ; }
+          run --init --server-cmd "borg serve" "$D/repo::a" \
+              "file:${{ steps.loop.outputs.dev }}p1" | tail -2
+          run --no-cache --server-cmd "borg serve" "$D/repo::b" \
+              "file:${{ steps.loop.outputs.dev }}p1" | tee zweiter.txt | tail -2
+          grep -q '0 new chunks' zweiter.txt \
+            || { echo "zweiter Lauf erzeugte neue Chunks -- Raster instabil" >&2; exit 1; }
+          echo "zweiter Lauf: 0 neue Chunks."
+          BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes borg check "$D/repo" \
+            && echo "echter borg prueft das Ergebnis sauber."

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+# tty1 traegt die Oberflaeche, tty2 das Textmenue als Rueckfallweg. Beide
+# getty-Instanzen muessen weg, sonst streiten sich zwei Prozesse um dasselbe
+# Terminal. tty3 bis tty6 bleiben als normale Anmeldung uebrig.
+systemctl enable borg-ui.service 2>/dev/null || true
+systemctl enable borg-recover.service 2>/dev/null || true
+systemctl mask getty@tty1.service 2>/dev/null || true
+systemctl mask getty@tty2.service 2>/dev/null || true
+
+# Ohne Display-Manager laeuft graphical.target ins Leere und der Bildschirm
+# bliebe bei "Reached target graphical.target" stehen. Das Rettungssystem hat
+# kein X; multi-user.target ist das richtige Ziel.
+systemctl set-default multi-user.target 2>/dev/null || true

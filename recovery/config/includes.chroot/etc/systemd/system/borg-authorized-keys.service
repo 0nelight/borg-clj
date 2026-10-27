@@ -1,0 +1,18 @@
+[Unit]
+Description=SSH-Schluessel fuer das Rettungssystem vom Bootserver holen
+# Muss vor sshd fertig sein, sonst nimmt der erste Anmeldeversuch noch die
+# alte Liste. network-online reicht hier als Bedingung: ohne Netz gibt es
+# ohnehin nichts zu holen, und das Skript beendet sich dann still.
+Wants=network-online.target
+After=network-online.target
+Before=ssh.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/borg-authorized-keys
+# Ein fehlender Bootserver darf den Start nicht aufhalten.
+TimeoutStartSec=40
+
+[Install]
+WantedBy=multi-user.target

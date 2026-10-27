@@ -1,0 +1,264 @@
+#!/bin/bash
+set -uo pipefail
+
+BORG=${BORG:-borgi}
+eval "BORG_EXTRA=(${BORGCLJ_BORG_ARGS:-})"
+bg() { "$BORG" "$@" "${BORG_EXTRA[@]}"; }
+STATE=/run/borg-recover
+mkdir -p "$STATE"
+REPO_FILE="$STATE/repo"
+BT="borg-imager recovery"
+
+die() { whiptail --title "$BT" --msgbox "$1" 14 78; }
+ask() { whiptail --title "$BT" --inputbox "$2" 12 78 "${3:-}" 3>&1 1>&2 2>&3; }
+yesno() { whiptail --title "$BT" --yesno "$1" "${2:-14}" 78; }
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+
+run_logged() {
+  local log="$STATE/last.log"
+  clear
+  echo "=== $* ===" | tee "$log"
+  "$@" 2>&1 | tee -a "$log"
+  local rc=${PIPESTATUS[0]}
+  echo
+  if [ "$rc" = 0 ]; then echo "finished."; else echo "FAILED (exit $rc)"; fi
+  echo "press enter to return to the menu"
+  read -r _
+  return "$rc"
+}
+
+check_network() {
+  if ip -4 route show default | grep -q .; then return 0; fi
+  if yesno "No network route was found.\n\nOpen the network configuration now?" 10; then
+    nmtui
+  fi
+}
+
+pick_repo() {
+  local cur=""
+  [ -f "$REPO_FILE" ] && cur=$(cat "$REPO_FILE")
+  local r
+  r=$(ask "" "Where is the borg repository?\n\n  ssh://user@host/srv/backup/repo\n  /mnt/usb/repo" "$cur") || return 1
+  [ -n "$r" ] || return 1
+  if ! bg list "$r" >"$STATE/archives" 2>"$STATE/err"; then
+    die "Could not open the repository:\n\n$(head -6 "$STATE/err")"
+    return 1
+  fi
+  echo "$r" > "$REPO_FILE"
+  return 0
+}
+
+pick_archive() {
+  local repo=$1 n=0 args=()
+  [ -s "$STATE/archives" ] || { die "The repository holds no archives."; return 1; }
+  while read -r a; do n=$((n+1)); args+=("$a" ""); done < <(tac "$STATE/archives")
+  whiptail --title "$BT" --menu "Which archive? (newest first)" 20 78 12 "${args[@]}" 3>&1 1>&2 2>&3
+}
+
+disk_menu() {
+  local args=()
+  while read -r name size model; do
+    args+=("/dev/$name" "$(human "$size")  ${model:-}")
+  done < <(lsblk -dnb -o NAME,SIZE,MODEL --nodeps | grep -vE '^(loop|sr|ram)')
+  [ ${#args[@]} -gt 0 ] || { die "No disks were detected.\n\nIf this machine uses Intel RST/VMD, the array may need mdadm --assemble, or switch the firmware to AHCI (note: Windows must already be installed in AHCI mode)."; return 1; }
+  whiptail --title "$BT" --menu "$1" 20 78 10 "${args[@]}" 3>&1 1>&2 2>&3
+}
+
+plan_values() {
+  # Liest den Bauplan eines Abbilds.
+  PLAN_LENGTH= PLAN_ALLOC= PLAN_MIN= PLAN_HIGH= PLAN_LETTER=
+  local args=(plan "$1::$2")
+  [ -n "${3:-}" ] && args+=(--partition "$3")
+  while IFS='=' read -r k v; do
+    case "$k" in
+      length) PLAN_LENGTH=$v;;
+      allocated) PLAN_ALLOC=$v;;
+      min_shrink) PLAN_MIN=$v;;
+      highest_allocated) PLAN_HIGH=$v;;
+      letter) PLAN_LETTER=$v;;
+    esac
+  done < <(bg "${args[@]}" 2>/dev/null)
+  [ -n "$PLAN_LENGTH" ]
+}
+
+spill_need() {
+  # Was beim Verkleinern ueber das Ziel hinausragt und waehrend des Laufs
+  # zwischengelagert werden muss.
+  local tsize=$1 over=0
+  [ -n "$PLAN_HIGH" ] && [ "$PLAN_HIGH" -gt "$tsize" ] && over=$((PLAN_HIGH - tsize))
+  echo $((over + 64 * 1024 * 1024))
+}
+
+scratch_menu() {
+  # Verkleinern legt neben die Zielpartition eine duenne Datei, die zusammen
+  # mit ihr die urspruengliche Groesse ergibt.
+  local need=$1 args=()
+  while read -r target avail; do
+    [ -n "$avail" ] && [ "$avail" -gt "$need" ] 2>/dev/null && args+=("$target" "$(human "$avail") free")
+  done < <(df --output=target,avail -B1 2>/dev/null | tail -n +2 | sort -k2 -nr | awk '{print $1, $2}')
+  [ ${#args[@]} -gt 0 ] || return 1
+  whiptail --title "$BT" --menu "Scratch space for the shrink (needs $(human "$need"))" 20 78 8 "${args[@]}" 3>&1 1>&2 2>&3
+}
+
+part_menu() {
+  local disk=$1 args=()
+  while read -r name size fstype; do
+    args+=("/dev/$name" "$(human "$size")  ${fstype:-unformatted}")
+  done < <(lsblk -nb -o NAME,SIZE,FSTYPE "$disk" | tail -n +2 | tr -d '`|-' | awk '{print $1, $2, $3}')
+  [ ${#args[@]} -gt 0 ] || { die "$disk has no partitions."; return 1; }
+  whiptail --title "$BT" --menu "$2" 20 78 10 "${args[@]}" 3>&1 1>&2 2>&3
+}
+
+show_archive() {
+  local repo=$1 arch=$2
+  local txt
+  txt=$(bg plan "$repo::$arch" 2>&1)
+  whiptail --title "$BT" --scrolltext --msgbox "$arch\n\n$txt" 22 78
+}
+
+do_whole_disk() {
+  local repo=$1 arch=$2 disk plan
+  disk=$(disk_menu "Restore the whole disk image onto which disk?") || return
+  plan=$(borg-restore-disk --repo "$repo" --archive "$arch" --target "$disk" --dry-run 2>&1)
+  whiptail --title "$BT" --scrolltext --msgbox "Plan for $disk\n\n$plan" 22 78
+  yesno "EVERYTHING ON $disk WILL BE DESTROYED.\n\nRestore $arch onto $disk now?" 12 || return
+  run_logged borg-restore-disk --repo "$repo" --archive "$arch" --target "$disk"
+}
+
+do_one_volume() {
+  local repo=$1 arch=$2 disk part pn plan scratch
+  pn=$(ask "" "Which partition of the image? Leave empty for a single-volume archive." "") || return
+  disk=$(disk_menu "Which disk holds the target partition?") || return
+  part=$(part_menu "$disk" "Restore into which partition?") || return
+
+  plan_values "$repo" "$arch" "$pn" || { die "Could not read the image plan."; return; }
+  local tsize; tsize=$(blockdev --getsize64 "$part")
+
+  # Drei Faelle, und der Nutzer soll sehen, in welchem er ist, BEVOR etwas
+  # zerstoert wird -- nicht erst an einer Fehlermeldung mittendrin.
+  local mode note force=0
+  if [ "$tsize" -ge "$PLAN_LENGTH" ]; then
+    mode="direct"
+    if [ "$tsize" -gt "$PLAN_LENGTH" ]; then
+      note="The target is larger. NTFS is expanded to fill it afterwards."
+    else
+      note="The target is exactly the right size."
+    fi
+  elif [ -z "$PLAN_MIN" ] || [ "$tsize" -ge "$PLAN_MIN" ]; then
+    mode="shrink"
+    note="NTFS is shrunk in place. Scratch space needed: $(human "$(spill_need "$tsize")").\nThe target is written as the run goes, not at the end."
+  else
+    mode="too small"
+    note="The content itself needs $(human "$PLAN_MIN"). Shrinking below that cuts\nit off. Only proceed if you know those blocks are expendable."
+  fi
+
+  whiptail --title "$BT" --scrolltext --msgbox \
+    "Restore ${PLAN_LETTER:+${PLAN_LETTER}: }from $arch\n\nimaged volume   $(human "$PLAN_LENGTH")\nin use          $(human "${PLAN_ALLOC:-0}")\nshrink limit    $(human "${PLAN_MIN:-0}")\ntarget $part    $(human "$tsize")\n\nmode: $mode\n\n$note" 20 78
+
+  if [ "$mode" = "too small" ]; then
+    yesno "$part is SMALLER than the shrink limit of $(human "$PLAN_MIN").\n\nTry anyway? Data beyond that point is lost." 12 || return
+    force=1
+  fi
+
+  local args=(--repo "$repo" --archive "$arch" --target "$part")
+  [ -n "$pn" ] && args+=(--partition "$pn")
+  [ "$force" = 1 ] && args+=(--force)
+  [ "$tsize" -gt "$PLAN_LENGTH" ] && args+=(--grow)
+
+  if [ "$mode" != "direct" ]; then
+    local need; need=$(spill_need "$tsize")
+    scratch=$(scratch_menu "$need") || {
+      die "No filesystem has $(human "$need") free.\n\nPlug in a disk, mount it, and try again."
+      return
+    }
+    args+=(--scratch "$scratch")
+  fi
+
+  plan=$(borg-restore-volume "${args[@]}" --dry-run 2>&1)
+  whiptail --title "$BT" --scrolltext --msgbox "Plan\n\n$plan" 22 78
+  yesno "EVERYTHING ON $part WILL BE DESTROYED.\n\nRestore now?" 12 || return
+  run_logged borg-restore-volume "${args[@]}"
+}
+
+do_partition_only() {
+  local repo=$1 arch=$2 disk
+  disk=$(disk_menu "Write the archive's partition table onto which disk?") || return
+  local size table
+  size=$(blockdev --getsize64 "$disk")
+  table=$(bg layout "$repo::$arch" --disk-size "$size" 2>&1)
+  whiptail --title "$BT" --scrolltext --msgbox "Partition table for $disk\n\n$table" 22 78
+  yesno "Write this table to $disk? All current partitions are lost." 10 || return
+  run_logged bash -c "$BORG layout '$repo::$arch' --disk-size $size ${BORGCLJ_BORG_ARGS:-} | sfdisk --wipe always '$disk'"
+}
+
+do_create_image() {
+  local repo=$1 src disk part archive
+  disk=$(disk_menu "Image which disk?") || return
+  if yesno "Image the WHOLE disk $disk?\n\nNo picks one partition instead." 10; then
+    src=$disk
+  else
+    src=$(part_menu "$disk" "Image which partition?") || return
+  fi
+  local fstype; fstype=$(lsblk -dno FSTYPE "$src" 2>/dev/null)
+  local size; size=$(blockdev --getsize64 "$src")
+  # Vorgabename wie in borg-image: der Hostname taugt nicht, im
+  # Rettungssystem heisst jede Maschine "rettung".
+  local m sn
+  m=$(tr -cd 'A-Za-z0-9-' < /sys/class/dmi/id/product_name 2>/dev/null | cut -c1-24)
+  sn=$(tr -cd 'A-Za-z0-9-' < /sys/class/dmi/id/product_serial 2>/dev/null | cut -c1-16)
+  archive=$(ask "" "Archive name" "${m:-maschine}${sn:+-$sn}-$(date +%F)") || return
+  [ -n "$archive" ] || return
+
+  # Der Unterschied ist gross genug, dass er vorher dastehen muss: mit
+  # Belegungskarte wird nur Belegtes gelesen, ohne sie das ganze Geraet.
+  local note
+  case "$fstype" in
+    ntfs) note="NTFS: only the clusters in use are read. Page file, hibernation file\nand the shadow copies are left out.";;
+    ext2|ext3|ext4) note="ext detected: only the blocks in use are read.";;
+    *) note="No allocation map for '${fstype:-unknown}': the whole device is read ($(human "$size")).\nImaging the partitions one by one reads far less.";;
+  esac
+  whiptail --title "$BT" --scrolltext --msgbox "Image $src -> $archive\n\nsize     $(human "$size")\nfstype   ${fstype:-unknown}\n\n$note" 18 78
+  yesno "Start imaging $src into $repo?" 10 || return
+  run_logged borg-image --repo "$repo" --source "$src" --archive "$archive"
+}
+
+main() {
+  check_network
+  while true; do
+    local repo="" arch=""
+    [ -f "$REPO_FILE" ] && repo=$(cat "$REPO_FILE")
+    local choice
+    choice=$(whiptail --title "$BT" --menu \
+      "Repository: ${repo:-<none chosen>}" 20 78 10 \
+      repo    "Choose the borg repository" \
+      image   "Create an image of a disk or partition" \
+      disk    "Restore a whole disk image" \
+      volume  "Restore one volume into a partition" \
+      table   "Write only the partition table" \
+      info    "Show what an archive contains" \
+      shell   "Drop to a root shell" \
+      log     "Show the last operation log" \
+      reboot  "Reboot" \
+      poweroff "Power off" 3>&1 1>&2 2>&3) || exit 0
+
+    case "$choice" in
+      repo) pick_repo;;
+      image) [ -n "$repo" ] && do_create_image "$repo" || die "Choose the repository first.";;
+      shell) clear; echo "type 'exit' to return to the menu"; bash -l;;
+      log) [ -f "$STATE/last.log" ] && whiptail --title "$BT" --scrolltext --textbox "$STATE/last.log" 22 78 || die "Nothing has run yet.";;
+      reboot) yesno "Reboot now?" 8 && reboot;;
+      poweroff) yesno "Power off now?" 8 && poweroff;;
+      *)
+        [ -n "$repo" ] || { die "Choose the repository first."; continue; }
+        arch=$(pick_archive "$repo") || continue
+        case "$choice" in
+          disk) do_whole_disk "$repo" "$arch";;
+          volume) do_one_volume "$repo" "$arch";;
+          table) do_partition_only "$repo" "$arch";;
+          info) show_archive "$repo" "$arch";;
+        esac;;
+    esac
+  done
+}
+
+main "$@"

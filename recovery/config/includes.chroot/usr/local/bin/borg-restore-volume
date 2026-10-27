@@ -1,0 +1,192 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+borg-restore-volume --repo LOCATION --archive NAME --target DEVICE [options]
+
+Restores one NTFS volume onto DEVICE, shrinking the filesystem when DEVICE is
+smaller. The shrink runs in place over a device-mapper overlay (target plus a
+sparse spill file); scratch needed is only what the image holds above the new
+size. The target is written as the run goes -- a failed run leaves it half
+written. --via-scratch is the older way and leaves it untouched until the end,
+but wants the volume's used bytes free somewhere.
+
+  --repo LOCATION     ssh://user@host/srv/repo, or a local path
+  --archive NAME      archive inside the repository
+  --target DEVICE     /dev/sda3, /dev/nvme0n1p3, or a file
+  --partition N       take partition N out of a whole-disk image
+  --image NAME        pick one image when the archive holds several
+  --scratch DIR       where the spill or work file goes (default: largest free mount)
+  --via-scratch       shrink a full-size copy elsewhere instead of in place
+  --grow              after restoring to a larger device, expand NTFS to fill it
+  --force             proceed even when the shrink target looks too small
+  --dry-run           print what would happen and stop
+USAGE
+}
+
+REPO= ARCHIVE= TARGET= PARTITION= IMAGE= SCRATCH= GROW=0 FORCE=0 DRY=0 VIA_SCRATCH=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO=$2; shift 2;;
+    --archive) ARCHIVE=$2; shift 2;;
+    --target) TARGET=$2; shift 2;;
+    --partition) PARTITION=$2; shift 2;;
+    --image) IMAGE=$2; shift 2;;
+    --scratch) SCRATCH=$2; shift 2;;
+    --via-scratch) VIA_SCRATCH=1; shift;;
+    --grow) GROW=1; shift;;
+    --force) FORCE=1; shift;;
+    --dry-run) DRY=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+[ -n "$REPO" ] && [ -n "$ARCHIVE" ] && [ -n "$TARGET" ] || { usage >&2; exit 2; }
+
+BORG=${BORG:-borgi}
+eval "BORG_EXTRA=(${BORGCLJ_BORG_ARGS:-})"
+bg() { "$BORG" "$@" "${BORG_EXTRA[@]}"; }
+BARGS=(--partition "$PARTITION")
+[ -n "$PARTITION" ] || BARGS=()
+[ -n "$IMAGE" ] && BARGS+=(--image "$IMAGE")
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+
+LENGTH= MIN_SHRINK= ALLOCATED= HIGHEST= LETTER= IMAGE_NAME=
+while IFS='=' read -r k v; do
+  case "$k" in
+    length) LENGTH=$v;;
+    min_shrink) MIN_SHRINK=$v;;
+    allocated) ALLOCATED=$v;;
+    highest_allocated) HIGHEST=$v;;
+    letter) LETTER=$v;;
+    image) IMAGE_NAME=$v;;
+  esac
+done < <(bg plan "$REPO::$ARCHIVE" "${BARGS[@]}")
+[ -n "$LENGTH" ] || { echo "could not read the image plan" >&2; exit 1; }
+
+if [ -b "$TARGET" ]; then
+  TSIZE=$(blockdev --getsize64 "$TARGET")
+elif [ -e "$TARGET" ]; then
+  TSIZE=$(stat -c%s "$TARGET")
+else
+  TSIZE=$LENGTH
+fi
+
+echo "image    ${IMAGE_NAME}${LETTER:+ (${LETTER}:)} ${PARTITION:+partition $PARTITION}"
+echo "volume   $(human "$LENGTH")${ALLOCATED:+, $(human "$ALLOCATED") in use}"
+echo "target   $TARGET  $(human "$TSIZE")"
+
+if [ "$TSIZE" -ge "$LENGTH" ]; then
+  echo "mode     direct (target is big enough)"
+  [ "$DRY" = 1 ] && exit 0
+  bg restore-image "$REPO::$ARCHIVE" "${BARGS[@]}" --to "$TARGET" --to-file --skip-zeros
+  if [ "$GROW" = 1 ] && [ "$TSIZE" -gt "$LENGTH" ] && [ -b "$TARGET" ]; then
+    echo "growing NTFS to fill $TARGET"
+    ntfsresize --force --force "$TARGET"
+  fi
+  ntfsfix -d "$TARGET" || true
+  echo "done"
+  exit 0
+fi
+
+echo "mode     shrink $(human "$LENGTH") -> $(human "$TSIZE")"
+if [ -n "$MIN_SHRINK" ] && [ "$TSIZE" -lt "$MIN_SHRINK" ] && [ "$FORCE" = 0 ]; then
+  echo "refusing: the volume holds data up to $(human "$MIN_SHRINK"); pass --force to try anyway" >&2
+  exit 1
+fi
+
+# Which way round: in place over an overlay, or through a full-size copy.
+OVERLAY=0
+if [ "$VIA_SCRATCH" = 0 ] && [ -b "$TARGET" ] &&
+   command -v dmsetup >/dev/null && command -v losetup >/dev/null; then
+  OVERLAY=1
+fi
+
+# Setzt SCRATCH (falls nicht vorgegeben) und AVAIL.
+AVAIL=
+pick_scratch() {   # $1 = bytes needed
+  local need=$1
+  if [ -z "$SCRATCH" ]; then
+    SCRATCH=$(df --output=target,avail -B1 2>/dev/null | tail -n +2 | sort -k2 -n -r |
+              awk -v n="$need" '$2 > n * 11 / 10 {print $1; exit}')
+  fi
+  [ -n "$SCRATCH" ] || { echo "no scratch filesystem with $(human "$need") free — pass --scratch DIR" >&2; exit 1; }
+  AVAIL=$(df -B1 --output=avail "$SCRATCH" | tail -1 | tr -dc 0-9)
+  [ "$AVAIL" -gt "$need" ] || { echo "$SCRATCH has $(human "$AVAIL") free, needs $(human "$need")" >&2; exit 1; }
+}
+
+if [ "$OVERLAY" = 1 ]; then
+  # Alles, was das Abbild oberhalb der neuen Groesse noch belegt, muss
+  # waehrend des Laufs irgendwo hin -- ntfsresize holt es danach herunter.
+  SPILL_NEED=0
+  if [ -n "$HIGHEST" ] && [ "$HIGHEST" -gt "$TSIZE" ]; then
+    SPILL_NEED=$((HIGHEST - TSIZE))
+  fi
+  pick_scratch $((SPILL_NEED + 64 * 1024 * 1024))
+  SPILL="$SCRATCH/borgclj-spill.$$.img"
+  echo "overlay  $TARGET + $SPILL  ($(human "$SPILL_NEED") expected to spill, $(human "$AVAIL") free)"
+  echo "         the target is written as the run goes, not at the end"
+  [ "$DRY" = 1 ] && exit 0
+
+  NAME="borgclj-restore-$$"
+  DEV="/dev/mapper/$NAME"
+  LOOP=
+  cleanup() {
+    dmsetup remove "$NAME" 2>/dev/null || true
+    [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null || true
+    rm -f "$SPILL"
+  }
+  trap cleanup EXIT
+
+  rm -f "$SPILL"
+  truncate -s $((LENGTH - TSIZE)) "$SPILL"
+  LOOP=$(losetup --find --show "$SPILL")
+  printf '0 %d linear %s 0\n%d %d linear %s 0\n' \
+    $((TSIZE / 512)) "$TARGET" \
+    $((TSIZE / 512)) $(((LENGTH - TSIZE) / 512)) "$LOOP" |
+    dmsetup create "$NAME"
+  udevadm settle || true
+
+  bg restore-image "$REPO::$ARCHIVE" "${BARGS[@]}" --to "$DEV" --to-file --skip-zeros
+
+  echo "checking how far NTFS can shrink"
+  ntfsresize --info --force "$DEV" 2>&1 | tail -4
+  if ! ntfsresize --force --force --size "$TSIZE" "$DEV"; then
+    echo "ntfsresize refused to shrink to $(human "$TSIZE") -- $TARGET is half written" >&2
+    exit 1
+  fi
+  sync
+  cleanup
+  trap - EXIT
+  ntfsfix -d "$TARGET" || true
+  echo "done — NTFS shrunk from $(human "$LENGTH") to $(human "$TSIZE")"
+  exit 0
+fi
+
+pick_scratch "${ALLOCATED:-$LENGTH}"
+
+WORK="$SCRATCH/borgclj-restore.$$.vol"
+echo "scratch  $WORK  ($(human "$AVAIL") free)"
+[ "$DRY" = 1 ] && exit 0
+cleanup() { rm -f "$WORK"; }
+trap cleanup EXIT
+
+rm -f "$WORK"
+truncate -s "$LENGTH" "$WORK"
+bg restore-image "$REPO::$ARCHIVE" "${BARGS[@]}" --to "$WORK" --to-file --skip-zeros
+
+echo "checking how far NTFS can shrink"
+ntfsresize --info --force "$WORK" 2>&1 | tail -4
+
+if ! ntfsresize --force --force --size "$TSIZE" "$WORK"; then
+  echo "ntfsresize refused to shrink to $(human "$TSIZE")" >&2
+  exit 1
+fi
+
+echo "copying $(human "$TSIZE") onto $TARGET"
+dd if="$WORK" of="$TARGET" bs=4M iflag=count_bytes count="$TSIZE" conv=notrunc status=progress
+sync
+ntfsfix -d "$TARGET" || true
+echo "done — NTFS shrunk from $(human "$LENGTH") to $(human "$TSIZE")"

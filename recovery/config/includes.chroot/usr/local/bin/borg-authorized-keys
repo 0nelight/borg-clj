@@ -1,0 +1,65 @@
+#!/bin/sh
+# Holt beim Start die Liste der SSH-Schluessel, die ins Rettungssystem duerfen.
+#
+# Warum nicht eingebacken: ein Schluessel im squashfs laesst sich nur durch
+# einen Neubau des Abbilds tauschen -- gut eine Stunde fuer eine Zeile Text.
+# Hier liegt die Liste beim Bootserver; wer sie aendert, aendert sie fuer den
+# naechsten Start jeder Maschine.
+#
+# Woher: entweder ausdruecklich per Kernelparameter
+#     borgclj.keys=http://rechner/pfad/authorized_keys
+# oder, wenn der fehlt, von demselben Server, von dem live-boot das
+# Wurzeldateisystem geholt hat (fetch=). Startet das System von einem
+# USB-Stick ohne Netz, findet sich keine Quelle und es bleibt beim Schluessel,
+# den build.sh eingebacken hat -- falls ueberhaupt einer eingebacken wurde.
+#
+# Das laeuft ueber HTTP im lokalen Netz, ohne Signatur. Wer den Verkehr
+# faelschen kann, legt sich damit einen eigenen Schluessel ins System. Das ist
+# hier kein neues Loch: derselbe Angreifer koennte gleich das ganze
+# Wurzeldateisystem austauschen, das ebenso per HTTP kommt.
+set -eu
+
+DEST=/root/.ssh/authorized_keys
+
+url_from_cmdline() {
+  for w in $(cat /proc/cmdline); do
+    case "$w" in
+      borgclj.keys=*) echo "${w#borgclj.keys=}"; return 0 ;;
+    esac
+  done
+  # Kein eigener Parameter: den Server aus fetch= uebernehmen und die Datei
+  # neben dem squashfs erwarten.
+  for w in $(cat /proc/cmdline); do
+    case "$w" in
+      fetch=http://*|fetch=https://*)
+        echo "${w#fetch=}" | sed 's![^/]*$!authorized_keys!'
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
+URL=$(url_from_cmdline) || {
+  echo "keine Schluesselquelle auf der Kernelzeile -- es bleibt beim Abbild" >&2
+  exit 0
+}
+
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+if ! curl -fsS --max-time 20 --retry 3 --retry-delay 2 -o "$TMP" "$URL"; then
+  echo "Schluesselliste nicht erreichbar: $URL" >&2
+  exit 0
+fi
+
+# Eine leere Antwort oder eine Fehlerseite darf einen vorhandenen Schluessel
+# nicht verdraengen. Es muss mindestens eine Zeile wie ein Schluessel aussehen.
+if ! grep -qE '^(ssh|ecdsa|sk-)[a-z0-9@.-]+ +AAAA' "$TMP"; then
+  echo "Antwort von $URL enthaelt keinen Schluessel -- unveraendert gelassen" >&2
+  exit 0
+fi
+
+mkdir -p /root/.ssh
+chmod 0700 /root/.ssh
+install -m 0600 "$TMP" "$DEST"
+echo "$(grep -cE '^(ssh|ecdsa|sk-)' "$DEST") Schluessel von $URL uebernommen"

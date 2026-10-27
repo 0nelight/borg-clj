@@ -1,0 +1,117 @@
+#!/bin/bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+borg-restore-disk --repo LOCATION --archive NAME --target DISK [options]
+
+Recreates the imaged disk on DISK. The partition table is rebuilt from the
+archive keeping the disk identifier and every partition GUID, so Windows' BCD
+entries still resolve; a smaller DISK shrinks the largest partition to fit.
+
+  --repo LOCATION   ssh://user@host/srv/repo, or a local path
+  --archive NAME    archive inside the repository
+  --target DISK     /dev/sda, /dev/nvme0n1 — the whole disk, not a partition
+  --scratch DIR     scratch for the shrink step
+  --via-scratch     shrink each volume in a full-size copy instead of in place
+  --force           allow a shrink below the last allocated cluster
+  --dry-run         print the plan and the partition table, then stop
+USAGE
+}
+
+REPO= ARCHIVE= TARGET= SCRATCH= FORCE=0 DRY=0 VIA_SCRATCH=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) REPO=$2; shift 2;;
+    --archive) ARCHIVE=$2; shift 2;;
+    --target) TARGET=$2; shift 2;;
+    --scratch) SCRATCH=$2; shift 2;;
+    --via-scratch) VIA_SCRATCH=1; shift;;
+    --force) FORCE=1; shift;;
+    --dry-run) DRY=1; shift;;
+    -h|--help) usage; exit 0;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+[ -n "$REPO" ] && [ -n "$ARCHIVE" ] && [ -n "$TARGET" ] || { usage >&2; exit 2; }
+[ -b "$TARGET" ] || { echo "$TARGET is not a block device" >&2; exit 1; }
+
+BORG=${BORG:-borgi}
+eval "BORG_EXTRA=(${BORGCLJ_BORG_ARGS:-})"
+bg() { "$BORG" "$@" "${BORG_EXTRA[@]}"; }
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+
+partdev() {
+  case "$1" in
+    *[0-9]) echo "${1}p${2}";;
+    *) echo "${1}${2}";;
+  esac
+}
+
+declare -A P
+STYLE= NPARTS= SRCLEN=
+while IFS='=' read -r k v; do
+  case "$k" in
+    style) STYLE=$v;;
+    partitions) NPARTS=$v;;
+    length) SRCLEN=$v;;
+    p*) P[$k]=$v;;
+  esac
+done < <(bg plan "$REPO::$ARCHIVE")
+[ -n "$NPARTS" ] || { echo "this archive does not hold a whole-disk image" >&2; exit 1; }
+
+TSIZE=$(blockdev --getsize64 "$TARGET")
+echo "source disk  $(human "$SRCLEN")  $STYLE, $NPARTS partitions"
+echo "target disk  $TARGET  $(human "$TSIZE")"
+echo
+
+LAYOUT=$(mktemp)
+trap 'rm -f "$LAYOUT"' EXIT
+LARGS=(--disk-size "$TSIZE")
+[ "$FORCE" = 1 ] && LARGS+=(--force)
+bg layout "$REPO::$ARCHIVE" "${LARGS[@]}" > "$LAYOUT"
+cat "$LAYOUT"
+echo
+
+if [ "$DRY" = 1 ]; then
+  for n in $(seq 1 "$NPARTS"); do
+    echo "partition $n -> $(partdev "$TARGET" "$n")  $(human "${P[p$n.length]:-0}")  ${P[p$n.letter]:+volume ${P[p$n.letter]}:}"
+  done
+  exit 0
+fi
+
+echo "writing the partition table"
+wipefs -a "$TARGET" >/dev/null
+sfdisk --wipe always --wipe-partitions always "$TARGET" < "$LAYOUT"
+partprobe "$TARGET" || true
+udevadm settle || true
+
+if [ "$STYLE" = "mbr" ]; then
+  echo "restoring MBR boot code"
+  MBR=$(mktemp)
+  bg restore-image "$REPO::$ARCHIVE" --range 0:440 --to "$MBR" --to-file
+  dd if="$MBR" of="$TARGET" bs=440 count=1 conv=notrunc status=none
+  rm -f "$MBR"
+fi
+
+for n in $(seq 1 "$NPARTS"); do
+  dev=$(partdev "$TARGET" "$n")
+  [ -b "$dev" ] || { echo "skipping partition $n: $dev did not appear" >&2; continue; }
+  echo
+  echo "=== partition $n -> $dev ==="
+  if [ -n "${P[p$n.letter]:-}" ]; then
+    args=(--repo "$REPO" --archive "$ARCHIVE" --partition "$n" --target "$dev")
+    [ -n "$SCRATCH" ] && args+=(--scratch "$SCRATCH")
+    [ "$VIA_SCRATCH" = 1 ] && args+=(--via-scratch)
+    [ "$FORCE" = 1 ] && args+=(--force)
+    borg-restore-volume "${args[@]}"
+  else
+    bg restore-image "$REPO::$ARCHIVE" --partition "$n" --to "$dev" --to-file --skip-zeros
+  fi
+done
+
+sync
+echo
+echo "disk restored. If Windows does not boot, the usual fix is to run"
+echo "  bootrec /rebuildbcd  and  bcdboot C:\\Windows /s S: /f ALL"
+echo "from Windows install media — the GUIDs were preserved, so it rarely is needed."

@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+lb config noauto \
+  --distribution "${BORGCLJ_SUITE:-trixie}" \
+  --parent-distribution "${BORGCLJ_SUITE:-trixie}" \
+  --archive-areas "main contrib non-free non-free-firmware" \
+  --parent-archive-areas "main contrib non-free non-free-firmware" \
+  --mirror-bootstrap "${BORGCLJ_MIRROR:-http://deb.debian.org/debian/}" \
+  --mirror-binary "${BORGCLJ_MIRROR:-http://deb.debian.org/debian/}" \
+  --architectures amd64 \
+  --linux-flavours amd64 \
+  --binary-images iso-hybrid \
+  --bootloaders "syslinux,grub-efi" \
+  --uefi-secure-boot enable \
+  --debian-installer none \
+  --memtest none \
+  --apt-indices false \
+  --apt-recommends false \
+  --firmware-binary true \
+  --firmware-chroot true \
+  --iso-application "borg-imager recovery" \
+  --iso-publisher "Grossegger" \
+  --iso-volume "BORGCLJ_RECOVERY" \
+  --bootappend-live "boot=live components quiet noeject" \
+  "${@}"

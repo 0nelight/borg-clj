@@ -1,0 +1,25 @@
+borg-clj
+Copyright (c) 2026 Christian Grossegger
+
+This product includes software developed by the BorgBackup project.
+
+  BorgBackup
+  Copyright (c) 2015-2024 The Borg Collective
+  Copyright (c) 2010-2014 Jonas Borgstroem <jonas@borgstrom.se>
+  https://github.com/borgbackup/borg
+  Licensed under the BSD 3-Clause License.
+
+Specifically, src/borgclj/buzhash_table.clj contains the 256-entry buzhash
+table taken verbatim from BorgBackup's content-defined chunker. The table is
+not incidental: borg-clj must produce the same chunk boundaries as borg, or
+the archives it writes would not deduplicate against archives written by borg
+itself.
+
+The repository format, the msgpack framing of its objects, the remote
+protocol spoken over ssh and the layout of the archive metadata are likewise
+modelled on BorgBackup so that the two interoperate. Those parts are an
+independent implementation written against borg's on-disk and on-the-wire
+behaviour rather than a translation of its source.
+
+borg-clj is not affiliated with, endorsed by, or a product of the BorgBackup
+project.
