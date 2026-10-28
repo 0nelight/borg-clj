@@ -1,3 +1,5 @@
+Most of this readme was created by LLMs - contact me directly if you have further questions.
+
 # borg-imager
 
 Images Windows disks and volumes straight into a [BorgBackup](https://www.borgbackup.org/)
