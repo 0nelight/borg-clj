@@ -1,4 +1,4 @@
-Most of this readme was created by LLMs - contact me directly if you have further questions.
+All of this readme and all of the code was created by LLMs - contact me directly if you have further questions.
 
 # borg-imager
 
